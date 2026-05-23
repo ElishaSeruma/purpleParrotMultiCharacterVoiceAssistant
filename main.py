@@ -1,15 +1,17 @@
 # main.py
 import os
 import json
+import asyncio
 from fastapi import FastAPI, HTTPException, status, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
-from livekit import api
+from livekit import api, rtc
 
 # Local structural imports
 from purpleParrotMultiCharacterVoiceAssistant.services.kami_brain import KamiBrain
+from purpleParrotMultiCharacterVoiceAssistant.services.phonetic_analyzer import SubSurfacePhoneticAnalyzer
 
 load_dotenv()
 
@@ -31,7 +33,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize our core state engine
+# Initialize foreground brain state engine
 brain = KamiBrain(default_persona="kami")
 
 class ConnectionTokenRequest(BaseModel):
@@ -67,14 +69,9 @@ async def generate_token(payload: ConnectionTokenRequest):
 
 @app.websocket("/api/v1/voice/control")
 async def voice_control_stream(websocket: WebSocket):
-    """
-    Persistent real-time bidirectional messaging link handling active persona hot-swaps
-    and broadcasting structural UI mutation payloads.
-    """
     await websocket.accept()
-    print("UI client connected directly to the Persona Control Plane.")
+    print("[CONTROL] UI client connected directly to the Persona Control Plane.")
     
-    # Broadcast current default state immediately upon connecting
     current = brain.active_persona
     initial_payload = {
         "ThemeMutationEvent": {
@@ -89,18 +86,36 @@ async def voice_control_stream(websocket: WebSocket):
     }
     await websocket.send_text(json.dumps(initial_payload))
 
+    # Instantiate our clinical background parsing context for this session channel
+    analyzer = SubSurfacePhoneticAnalyzer(learner_id="learner-elisha-01", room_name="parrot-test-room")
+    analyzer_task = asyncio.create_task(analyzer.start_analysis_loop())
+
+    # Simulate inbound raw PCM data streaming over LiveKit WebRTC Track buffers
+    async def simulate_livekit_audio_feed():
+        try:
+            fake_frame = rtc.AudioFrame(
+                data=b'\x00' * 960, # 20ms of empty 16-bit linear PCM frame data at 24kHz
+                sample_rate=24000,
+                num_channels=1,
+                samples_per_channel=480
+            )
+            while analyzer.is_processing:
+                await analyzer.push_audio_frame(fake_frame)
+                await asyncio.sleep(0.02) # Feed data exactly every 20ms to match genuine WebRTC timelines
+        except asyncio.CancelledError:
+            pass
+
+    audio_simulation_task = asyncio.create_task(simulate_livekit_audio_feed())
+
     try:
         while True:
-            # Await input execution commands from client interface toggles
             data = await websocket.receive_text()
             message = json.loads(data)
             
             if "request_persona_mutation" in message:
                 target = message["request_persona_mutation"]
-                # Mutate the server-side brain configuration
                 updated_persona = brain.switch_persona(target)
                 
-                # Format complete architectural System 4.2 payload response
                 mutation_event = {
                     "ThemeMutationEvent": {
                         "target_persona": target,
@@ -112,17 +127,27 @@ async def voice_control_stream(websocket: WebSocket):
                         }
                     }
                 }
-                
-                # Emit system instruction update visualization logs to terminal
-                print(f"=== UPDATED SYSTEM PROMPT COMPILATION ({target}) ===")
-                print(brain.compile_system_instructions())
-                print("=====================================================")
-                
-                # Sync mutation data instantly straight back to UI client
                 await websocket.send_text(json.dumps(mutation_event))
 
-    except WebSocketDisconnect:
-        print("UI client severed the control connection pipeline.")
+    except (WebSocketDisconnect, Exception) as e:
+        print(f"[CONTROL] UI connection tracking update: Client disconnected ({type(e).__name__}).")
+    finally:
+        # 1. STOP THE ANALYZER IMMEDIATELY AND CAPTURE LOGS FIRST BEFORE AWAITING TASK SHUTDOWNS
+        analyzer.stop()
+        
+        print("\n=======================================================")
+        print("=== FINAL THERAPIST ROLLING PROGRESS SUMMARY RECORD ===")
+        print(json.dumps(analyzer.generate_therapist_rolling_summary(), indent=2))
+        print("=======================================================\n")
+        
+        # 2. Safely tear down active concurrent tasks
+        audio_simulation_task.cancel()
+        try:
+            # Shield the analyzer task termination so it doesn't get swept away by ASGI worker shutdown
+            await asyncio.shield(analyzer_task)
+        except Exception:
+            pass
+        print("[SYSTEM] Audio streaming simulation and sub-surface workers cleanly defused.")
 
 @app.get("/sandbox", response_class=HTMLResponse)
 async def serve_sandbox():
