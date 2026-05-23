@@ -1,7 +1,9 @@
 # services/local_whisper_stt.py
 import asyncio
 import logging
+import time
 import numpy as np
+from concurrent.futures import Executor
 from typing import Optional
 from livekit import rtc
 from livekit.agents import APIConnectOptions, stt
@@ -10,7 +12,7 @@ logger = logging.getLogger("local_whisper_stt")
 logger.setLevel(logging.INFO)
 
 class LocalWhisperSTT(stt.STT):
-    def __init__(self):
+    def __init__(self, executor: Executor | None = None):
         super().__init__(
             capabilities=stt.STTCapabilities(
                 streaming=True,
@@ -18,6 +20,7 @@ class LocalWhisperSTT(stt.STT):
                 diarization=False
             )
         )
+        self._executor = executor
         # Load the tiny optimized faster-whisper model into local RAM/VRAM
         from faster_whisper import WhisperModel
         logger.info("Initializing Localized Faster-Whisper Model matrix (cpu/tiny)...")
@@ -38,6 +41,7 @@ class LocalWhisperSTT(stt.STT):
             model=self._model,
             language=language or "en",
             conn_options=conn_options or APIConnectOptions(),
+            executor=self._executor,
         )
 
     async def _recognize_impl(
@@ -51,17 +55,20 @@ class LocalWhisperSTT(stt.STT):
         Required single-frame abstract implementation fallback for non-streaming audio chunks.
         Transforms an isolated AudioFrame directly into a finished SpeechEvent.
         """
-        # Convert incoming audio buffer frame directly to float32 dimensions
-        audio_np = np.frombuffer(buffer.data, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_np = _frame_to_float32(buffer)
+        logger.info("single_frame_pcm_summary=%s", _pcm_summary(audio_np, buffer.sample_rate, buffer.num_channels))
         
         # Offload the blocking transcription block to an executor thread
         loop = asyncio.get_running_loop()
+        started_at = time.perf_counter()
         segments, info = await loop.run_in_executor(
-            None, 
+            self._executor,
             lambda: self._model.transcribe(audio_np, beam_size=1, language=language or "en")
         )
+        duration_ms = (time.perf_counter() - started_at) * 1000
         
         full_text = "".join([seg.text for seg in segments]).strip()
+        logger.info("single_frame_transcription_duration_ms=%.2f text_length=%d", duration_ms, len(full_text))
         
         # Return a finalized final transcript payload event
         return stt.SpeechEvent(
@@ -78,10 +85,12 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
         model,
         language: str,
         conn_options: APIConnectOptions,
+        executor: Executor | None,
     ):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=16000)
         self._model = model
         self._language = language
+        self._executor = executor
 
     async def _run(self) -> None:
         """
@@ -99,6 +108,13 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
 
             # Dynamically append raw linear 16-bit PCM buffer array allocations
             audio_buffer.extend(item.data)
+            logger.debug(
+                "stt_frame_received sample_rate=%s channels=%s samples_per_channel=%s buffer_bytes=%s",
+                item.sample_rate,
+                item.num_channels,
+                item.samples_per_channel,
+                len(audio_buffer),
+            )
 
             # Process rolling 500ms windows at 16kHz, then clear to avoid repeated transcripts.
             if len(audio_buffer) >= 16000:
@@ -113,18 +129,28 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
             return
 
         # Transform standard 16-bit PCM allocations to float32 dimensions
-        audio_np = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+        audio_np = _pcm_bytes_to_float32(raw_bytes)
+        summary = _pcm_summary(audio_np, sample_rate=16000, num_channels=1)
+        logger.info("stream_pcm_summary event_type=%s %s", event_type.value, summary)
 
         # Offload to executor to keep the main event thread non-blocking
         loop = asyncio.get_running_loop()
+        started_at = time.perf_counter()
         segments, info = await loop.run_in_executor(
-            None,
+            self._executor,
             lambda: self._model.transcribe(audio_np, beam_size=1, language=self._language)
         )
+        duration_ms = (time.perf_counter() - started_at) * 1000
 
         segments = list(segments)
+        full_text = "".join([seg.text for seg in segments]).strip()
+        logger.info(
+            "stream_transcription_duration_ms=%.2f event_type=%s text_length=%d",
+            duration_ms,
+            event_type.value,
+            len(full_text),
+        )
         if segments:
-            full_text = "".join([seg.text for seg in segments]).strip()
             if full_text:
                 # Construct standard compliant structural events
                 await self._event_ch.send(
@@ -133,3 +159,33 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
                         alternatives=[stt.SpeechData(text=full_text, language=self._language)]
                     )
                 )
+
+
+def _frame_to_float32(frame: rtc.AudioFrame) -> np.ndarray:
+    return _pcm_bytes_to_float32(frame.data)
+
+
+def _pcm_bytes_to_float32(raw_pcm) -> np.ndarray:
+    pcm_i16 = np.frombuffer(raw_pcm, dtype=np.int16)
+    return pcm_i16.astype(np.float32) / 32768.0
+
+
+def _pcm_summary(audio_np: np.ndarray, sample_rate: int, num_channels: int) -> dict:
+    if audio_np.size == 0:
+        return {
+            "sample_rate": sample_rate,
+            "channels": num_channels,
+            "samples": 0,
+            "duration_ms": 0.0,
+        }
+
+    return {
+        "sample_rate": sample_rate,
+        "channels": num_channels,
+        "samples": int(audio_np.size),
+        "duration_ms": round((audio_np.size / max(sample_rate * num_channels, 1)) * 1000, 2),
+        "float32_min": round(float(audio_np.min()), 6),
+        "float32_max": round(float(audio_np.max()), 6),
+        "float32_rms": round(float(np.sqrt(np.mean(np.square(audio_np)))), 6),
+        "clipped": bool(np.any(audio_np <= -1.0) or np.any(audio_np >= 0.999969)),
+    }
