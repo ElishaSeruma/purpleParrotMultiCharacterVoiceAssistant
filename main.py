@@ -162,7 +162,13 @@ async def health_check():
     return {"status": "healthy", "active_persona": brain.active_persona_name}
 
 
-local_stt_engine = LocalWhisperSTT()
+local_stt_engine: LocalWhisperSTT | None = None
+
+def get_local_stt_engine() -> LocalWhisperSTT:
+    global local_stt_engine
+    if local_stt_engine is None:
+        local_stt_engine = LocalWhisperSTT()
+    return local_stt_engine
 
 @app.post("/api/v1/test/stt-pipeline")
 async def simulate_live_stt_feed():
@@ -171,6 +177,7 @@ async def simulate_live_stt_feed():
     correctly ingests data arrays and transforms them into text models.
     """
     print("\n--- TRIGGERING LOCAL WHISPER STT STREAM TEST ROUTINE ---")
+    local_stt_engine = get_local_stt_engine()
     stt_stream = local_stt_engine.stream()
     
     # Generate 1 second of mock vocal 16kHz PCM data frames
@@ -201,7 +208,13 @@ async def simulate_live_stt_feed():
     print("--- STT BLUEPRINT PIPELINE CHECK VERIFIED COMPLETE ---\n")
     return {"status": "Whisper engine loop validated successfully."}
 
-local_tts_engine = LocalKokoroTTS()
+local_tts_engine: LocalKokoroTTS | None = None
+
+def get_local_tts_engine() -> LocalKokoroTTS:
+    global local_tts_engine
+    if local_tts_engine is None:
+        local_tts_engine = LocalKokoroTTS()
+    return local_tts_engine
 
 @app.post("/api/v1/test/tts-pipeline")
 async def simulate_live_tts_feed(persona: str = "patty"):
@@ -210,6 +223,7 @@ async def simulate_live_tts_feed(persona: str = "patty"):
     can target individual persona prints and output operational audio signals.
     """
     print(f"\n--- TRIGGERING LOCAL KOKORO TTS SYNTHESIS FOR CHARACTER: {persona.upper()} ---")
+    local_tts_engine = get_local_tts_engine()
     
     # Resolve the corresponding underlying vocal index print pattern
     voice_print = local_tts_engine._get_voice_for_persona(persona)

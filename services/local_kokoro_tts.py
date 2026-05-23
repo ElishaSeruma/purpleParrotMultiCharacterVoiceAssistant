@@ -3,10 +3,10 @@ import asyncio
 import os
 import logging
 import numpy as np
-from typing import Optional, AsyncIterator
+import uuid
+from typing import Optional
 from huggingface_hub import hf_hub_download
-from livekit import rtc
-from livekit.agents import tts
+from livekit.agents import APIConnectOptions, tts
 
 logger = logging.getLogger("local_kokoro_tts")
 logger.setLevel(logging.INFO)
@@ -20,22 +20,9 @@ class LocalKokoroTTS(tts.TTS):
         )
         # Import dynamically to isolate resource extraction paths
         from kokoro_onnx import Kokoro
-        
-        logger.info("Resolving official Kokoro-82M ONNX model assets via authenticated HuggingFace Hub client...")
-        
-        # Primary official repository identifier
-        repo_id = "hexgrad/Kokoro-82M"
-        
-        try:
-            # hexgrad stores the main model file as "model.onnx" and weights matrices as "voices.bin"
-            model_path = hf_hub_download(repo_id=repo_id, filename="model.onnx")
-            voices_path = hf_hub_download(repo_id=repo_id, filename="voices.bin")
-        except Exception as e:
-            logger.error(f"Primary repository target resolution failed: {e}. Trying fallback model layout...")
-            # Fallback repository layout mapping if structure shifts
-            repo_id = "onnx-community/Kokoro-82M-ONNX"
-            model_path = hf_hub_download(repo_id=repo_id, filename="onnx/model.onnx")
-            voices_path = hf_hub_download(repo_id=repo_id, filename="voices.bin")
+
+        logger.info("Resolving Kokoro ONNX model assets...")
+        model_path, voices_path = self._resolve_model_assets()
 
         logger.info(f"Successfully retrieved model: {model_path}")
         logger.info(f"Successfully retrieved voice vectors: {voices_path}")
@@ -52,6 +39,36 @@ class LocalKokoroTTS(tts.TTS):
             "zeni": "af_sky"          # Analytical, crisp, clean speech tone
         }
 
+    def _resolve_model_assets(self) -> tuple[str, str]:
+        model_path = os.getenv("KOKORO_MODEL_PATH")
+        voices_path = os.getenv("KOKORO_VOICES_PATH")
+
+        if model_path and voices_path:
+            if not os.path.exists(model_path):
+                raise FileNotFoundError(f"KOKORO_MODEL_PATH does not exist: {model_path}")
+            if not os.path.exists(voices_path):
+                raise FileNotFoundError(f"KOKORO_VOICES_PATH does not exist: {voices_path}")
+            return model_path, voices_path
+
+        repo_id = os.getenv("KOKORO_HF_REPO", "fastrtc/kokoro-onnx")
+        model_file = os.getenv("KOKORO_MODEL_FILE", "kokoro-v1.0.onnx")
+        voices_file = os.getenv("KOKORO_VOICES_FILE", "voices-v1.0.bin")
+
+        try:
+            return (
+                hf_hub_download(repo_id=repo_id, filename=model_file),
+                hf_hub_download(repo_id=repo_id, filename=voices_file),
+            )
+        except Exception:
+            logger.exception(
+                "Failed to download Kokoro assets from repo=%s model=%s voices=%s. "
+                "Set KOKORO_MODEL_PATH and KOKORO_VOICES_PATH to use local files.",
+                repo_id,
+                model_file,
+                voices_file,
+            )
+            raise
+
     def _get_voice_for_persona(self, persona_name: str) -> str:
         return self._voice_print_matrix.get(persona_name.lower(), "af_bella")
 
@@ -59,43 +76,58 @@ class LocalKokoroTTS(tts.TTS):
         self, 
         text: str, 
         *, 
-        voice: Optional[str] = None
-    ) -> "LocalKokoroSynthesizedAudio":
+        conn_options: Optional[APIConnectOptions] = None,
+        voice: Optional[str] = None,
+    ) -> "LocalKokoroChunkedStream":
         """
         Synthesizes a standalone, static text block into a complete media frame return object.
         """
         selected_voice = voice or "af_bella"
-        return LocalKokoroSynthesizedAudio(self._kokoro, text, selected_voice)
+        return LocalKokoroChunkedStream(
+            tts=self,
+            kokoro=self._kokoro,
+            input_text=text,
+            voice=selected_voice,
+            conn_options=conn_options or APIConnectOptions(),
+        )
 
 
-class LocalKokoroSynthesizedAudio(tts.SynthesizedAudio):
-    def __init__(self, kokoro, text: str, voice: str):
+class LocalKokoroChunkedStream(tts.ChunkedStream):
+    def __init__(
+        self,
+        *,
+        tts: LocalKokoroTTS,
+        kokoro,
+        input_text: str,
+        voice: str,
+        conn_options: APIConnectOptions,
+    ):
+        super().__init__(tts=tts, input_text=input_text, conn_options=conn_options)
         self._kokoro = kokoro
-        self._text = text
+        self._text = input_text
         self._voice = voice
 
-    async def __aiter__(self) -> AsyncIterator[tts.SynthesizedChunks]:
+    async def _run(self, output_emitter: tts.AudioEmitter) -> None:
         """
-        Iterates over generated audio chunks. Transforms Kokoro's native 
+        Generates audio and hands raw PCM to LiveKit's current ChunkedStream API.
+        Transforms Kokoro's native
         24kHz float32 arrays into standard LiveKit 24kHz 16-bit linear PCM arrays.
         """
         loop = asyncio.get_running_loop()
-        
+
         # Offload high-density audio wave synthesis to executor threads
         samples, sample_rate = await loop.run_in_executor(
-            None, 
+            None,
             lambda: self._kokoro.create(self._text, voice=self._voice, speed=1.0)
         )
-        
+
         # Convert raw float array outputs directly back to standard int16 linear PCM allocations
-        pcm_data = (samples * 32767).astype(np.int16).tobytes()
-        
-        # Pack the raw data into an official compliant frame allocation block
-        frame = rtc.AudioFrame(
-            data=pcm_data,
-            sample_rate=24000, 
+        pcm_data = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+
+        output_emitter.initialize(
+            request_id=f"kokoro-{uuid.uuid4().hex}",
+            sample_rate=sample_rate or 24000,
             num_channels=1,
-            samples_per_channel=len(pcm_data) // 2
+            mime_type="audio/pcm",
         )
-        
-        yield tts.SynthesizedChunks(text=self._text, frame=frame)
+        output_emitter.push(pcm_data)
