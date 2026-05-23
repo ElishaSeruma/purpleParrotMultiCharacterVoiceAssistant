@@ -36,6 +36,11 @@ MODEL_WARMUP_TTS_ENABLED = os.getenv("MODEL_WARMUP_TTS_ENABLED", "true").lower()
 MODEL_WARMUP_STT_ENABLED = os.getenv("MODEL_WARMUP_STT_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 MODEL_WARMUP_INFERENCE_ENABLED = os.getenv("MODEL_WARMUP_INFERENCE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 MODEL_WARMUP_START_DELAY_SECONDS = float(os.getenv("MODEL_WARMUP_START_DELAY_SECONDS", "0.25"))
+MODEL_WARMUP_TTS_TEXTS = [
+    text.strip()
+    for text in os.getenv("MODEL_WARMUP_TTS_TEXTS", "Hi.|Ready.").split("|")
+    if text.strip()
+]
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"))
 logger = logging.getLogger("purple_parrot_main")
@@ -158,10 +163,11 @@ async def warm_models_after_startup() -> None:
             for voice in dict.fromkeys(PERSONA_VOICE_MATRIX.values()):
                 engine._get_voice_for_persona(next((persona for persona, mapped_voice in PERSONA_VOICE_MATRIX.items() if mapped_voice == voice), "kami"))
                 if MODEL_WARMUP_INFERENCE_ENABLED:
-                    await loop.run_in_executor(
-                        audio_inference_executor,
-                        lambda voice=voice: engine._kokoro.create("Ready.", voice=voice, speed=1.0),
-                    )
+                    for warm_text in MODEL_WARMUP_TTS_TEXTS:
+                        await loop.run_in_executor(
+                            audio_inference_executor,
+                            lambda voice=voice, warm_text=warm_text: engine.prewarm_text(warm_text, voice=voice, speed=1.0),
+                        )
                 voices_warmed.append(voice)
             duration_ms = (time.perf_counter() - service_started) * 1000
             mark_warmup_service("tts", "ready", duration_ms, f"voices_warmed={','.join(voices_warmed)}")
@@ -364,7 +370,7 @@ def get_local_stt_engine() -> LocalWhisperSTT:
     return local_stt_engine
 
 @app.post("/api/v1/test/stt-pipeline")
-async def simulate_live_stt_feed():
+async def simulate_live_stt_feed(force_error: bool = False):
     """
     Simulation route validating that LiveKit's abstract stream interface 
     correctly ingests data arrays and transforms them into text models.
@@ -372,6 +378,8 @@ async def simulate_live_stt_feed():
     print("\n--- TRIGGERING LOCAL WHISPER STT STREAM TEST ROUTINE ---")
     endpoint_started_at = time.perf_counter()
     local_stt_engine = get_local_stt_engine()
+    if force_error:
+        local_stt_engine.force_next_error()
     stt_stream = local_stt_engine.stream()
     
     # Generate 1 second of mock vocal 16kHz PCM data frames
@@ -406,6 +414,7 @@ async def simulate_live_stt_feed():
         "status": "Whisper engine loop validated successfully.",
         "latency_ms": latency_ms,
         "memory": memory_snapshot(),
+        "forced_error": force_error,
     }
 
 local_tts_engine: LocalKokoroTTS | None = None
@@ -420,6 +429,7 @@ def get_local_tts_engine() -> LocalKokoroTTS:
 async def simulate_live_tts_feed(
     persona: Optional[str] = None,
     dry_run: bool = False,
+    force_error: bool = False,
     text: str = "Hello Elisha! I am operating as your local safety and speech assistant. Systems are active.",
 ):
     """
@@ -451,7 +461,8 @@ async def simulate_live_tts_feed(
     # Resolve through the live TTS adapter too, so logs prove the active engine agrees.
     voice_print = local_tts_engine._get_voice_for_persona(active_persona)
     # Fire up the synthesizer core adapter loop
-    audio_stream = local_tts_engine.synthesize(text, voice=voice_print)
+    text_to_synthesize = "__force_kokoro_error__" if force_error else text
+    audio_stream = local_tts_engine.synthesize(text_to_synthesize, voice=voice_print)
     
     print("[SYSTEM] Audio synthesis computation processing...")
     chunks = 0
@@ -471,4 +482,5 @@ async def simulate_live_tts_feed(
         "chunks": chunks,
         "latency_ms": latency_ms,
         "memory": memory_snapshot(),
+        "forced_error": force_error,
     }

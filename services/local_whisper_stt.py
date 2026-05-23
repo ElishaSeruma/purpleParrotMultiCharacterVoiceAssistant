@@ -1,6 +1,7 @@
 # services/local_whisper_stt.py
 import asyncio
 import logging
+import os
 import time
 import numpy as np
 from concurrent.futures import Executor
@@ -21,6 +22,7 @@ class LocalWhisperSTT(stt.STT):
             )
         )
         self._executor = executor
+        self._force_next_error = False
         # Load the tiny optimized faster-whisper model into local RAM/VRAM
         from faster_whisper import WhisperModel
         logger.info("Initializing Localized Faster-Whisper Model matrix (cpu/tiny)...")
@@ -42,7 +44,17 @@ class LocalWhisperSTT(stt.STT):
             language=language or "en",
             conn_options=conn_options or APIConnectOptions(),
             executor=self._executor,
+            should_force_error=self._consume_force_next_error,
         )
+
+    def force_next_error(self) -> None:
+        self._force_next_error = True
+
+    def _consume_force_next_error(self) -> bool:
+        if self._force_next_error:
+            self._force_next_error = False
+            return True
+        return os.getenv("WHISPER_FORCE_TRANSCRIPTION_ERROR", "").lower() in {"1", "true", "yes", "on"}
 
     async def _recognize_impl(
         self, 
@@ -86,11 +98,13 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
         language: str,
         conn_options: APIConnectOptions,
         executor: Executor | None,
+        should_force_error,
     ):
         super().__init__(stt=stt, conn_options=conn_options, sample_rate=16000)
         self._model = model
         self._language = language
         self._executor = executor
+        self._should_force_error = should_force_error
 
     async def _run(self) -> None:
         """
@@ -136,29 +150,42 @@ class LocalWhisperRecognizeStream(stt.RecognizeStream):
         # Offload to executor to keep the main event thread non-blocking
         loop = asyncio.get_running_loop()
         started_at = time.perf_counter()
-        segments, info = await loop.run_in_executor(
-            self._executor,
-            lambda: self._model.transcribe(audio_np, beam_size=1, language=self._language)
-        )
-        duration_ms = (time.perf_counter() - started_at) * 1000
+        try:
+            if self._should_force_error():
+                raise RuntimeError("Forced Whisper transcription error for resiliency testing")
 
-        segments = list(segments)
-        full_text = "".join([seg.text for seg in segments]).strip()
-        logger.info(
-            "stream_transcription_duration_ms=%.2f event_type=%s text_length=%d",
-            duration_ms,
-            event_type.value,
-            len(full_text),
-        )
-        if segments:
-            if full_text:
-                # Construct standard compliant structural events
-                await self._event_ch.send(
-                    stt.SpeechEvent(
-                        type=event_type,
-                        alternatives=[stt.SpeechData(text=full_text, language=self._language)]
+            segments, info = await loop.run_in_executor(
+                self._executor,
+                lambda: self._model.transcribe(audio_np, beam_size=1, language=self._language)
+            )
+            duration_ms = (time.perf_counter() - started_at) * 1000
+
+            segments = list(segments)
+            full_text = "".join([seg.text for seg in segments]).strip()
+            logger.info(
+                "stream_transcription_duration_ms=%.2f event_type=%s text_length=%d fallback=%s",
+                duration_ms,
+                event_type.value,
+                len(full_text),
+                False,
+            )
+            if segments:
+                if full_text:
+                    # Construct standard compliant structural events
+                    await self._event_ch.send(
+                        stt.SpeechEvent(
+                            type=event_type,
+                            alternatives=[stt.SpeechData(text=full_text, language=self._language)]
+                        )
                     )
-                )
+        except Exception:
+            duration_ms = (time.perf_counter() - started_at) * 1000
+            logger.exception(
+                "stream_transcription_failed duration_ms=%.2f event_type=%s audio_samples=%d fallback=empty_transcript",
+                duration_ms,
+                event_type.value,
+                int(audio_np.size),
+            )
 
 
 def _frame_to_float32(frame: rtc.AudioFrame) -> np.ndarray:
