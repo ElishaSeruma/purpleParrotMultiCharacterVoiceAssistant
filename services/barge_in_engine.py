@@ -9,6 +9,7 @@ class InterruptionCapablePlaybackQueue:
     def __init__(self):
         self.playback_queue = asyncio.Queue()
         self.current_playback_task = None
+        self.last_interrupt_snapshot = None
 
     async def enqueue_audio_chunk(self, audio_chunk: bytes):
         """
@@ -48,17 +49,29 @@ class InterruptionCapablePlaybackQueue:
         learner began speaking, this triggers. Drops upcoming responses immediately.
         """
         logger.info("[BARGE-IN ENGAGED] User interruption registered. Purging outbound audio pipeline.")
+        queued_before = self.playback_queue.qsize()
+        active_cancelled = False
         
         # 1. Kill active rendering immediately
         if self.current_playback_task and not self.current_playback_task.done():
             self.current_playback_task.cancel()
+            active_cancelled = True
             
         # 2. Flush any accumulated unplayed audio sentences completely out of memory
+        purged_chunks = 0
         while not self.playback_queue.empty():
             try:
                 self.playback_queue.get_nowait()
                 self.playback_queue.task_done()
+                purged_chunks += 1
             except asyncio.QueueEmpty:
                 break
                 
+        self.last_interrupt_snapshot = {
+            "queued_before": queued_before,
+            "purged_chunks": purged_chunks,
+            "queued_after": self.playback_queue.qsize(),
+            "active_task_cancelled": active_cancelled,
+        }
         logger.info("[BARGE-IN COMPLETE] Speaker queues are clean. Ready for inbound speech capture.")
+        return self.last_interrupt_snapshot

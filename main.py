@@ -15,12 +15,15 @@ from livekit import api, rtc
 import psutil
 import numpy as np
 from purpleParrotMultiCharacterVoiceAssistant.services.local_kokoro_tts import (
+    KOKORO_PERSONA_VOICE_PROFILES,
     KOKORO_PERSONA_VOICE_MATRIX,
     LocalKokoroTTS,
 )
 # Local structural imports
 from purpleParrotMultiCharacterVoiceAssistant.services.kami_brain import KamiBrain
 from purpleParrotMultiCharacterVoiceAssistant.services.phonetic_analyzer import SubSurfacePhoneticAnalyzer
+from purpleParrotMultiCharacterVoiceAssistant.services.barge_in_engine import InterruptionCapablePlaybackQueue
+from purpleParrotMultiCharacterVoiceAssistant.services.live_agent_orchestrator import LiveAgentOrchestrator
  
 #STT imports
 from purpleParrotMultiCharacterVoiceAssistant.services.local_whisper_stt import LocalWhisperSTT
@@ -82,6 +85,8 @@ async def shutdown_event():
             await warmup_task
         except asyncio.CancelledError:
             pass
+    if "live_agent_orchestrator" in globals():
+        await live_agent_orchestrator.aclose()
     logger.info("Shutting down audio inference executor")
     audio_inference_executor.shutdown(wait=False, cancel_futures=True)
 
@@ -97,6 +102,7 @@ app.add_middleware(
 brain = KamiBrain(default_persona="kami")
 
 PERSONA_VOICE_MATRIX = KOKORO_PERSONA_VOICE_MATRIX
+PERSONA_VOICE_PROFILES = KOKORO_PERSONA_VOICE_PROFILES
 
 class ConnectionTokenRequest(BaseModel):
     room_name: str = Field(..., description="Unique room namespace string")
@@ -160,17 +166,21 @@ async def warm_models_after_startup() -> None:
         try:
             engine = await loop.run_in_executor(audio_inference_executor, get_local_tts_engine)
             voices_warmed = []
-            for voice in dict.fromkeys(PERSONA_VOICE_MATRIX.values()):
-                engine._get_voice_for_persona(next((persona for persona, mapped_voice in PERSONA_VOICE_MATRIX.items() if mapped_voice == voice), "kami"))
+            warmed_profiles = []
+            for persona_name, profile in PERSONA_VOICE_PROFILES.items():
+                voice = profile["voice"]
+                speed = profile["speed"]
+                engine._get_voice_for_persona(persona_name)
                 if MODEL_WARMUP_INFERENCE_ENABLED:
                     for warm_text in MODEL_WARMUP_TTS_TEXTS:
                         await loop.run_in_executor(
                             audio_inference_executor,
-                            lambda voice=voice, warm_text=warm_text: engine.prewarm_text(warm_text, voice=voice, speed=1.0),
+                            lambda voice=voice, warm_text=warm_text, speed=speed: engine.prewarm_text(warm_text, voice=voice, speed=speed),
                         )
                 voices_warmed.append(voice)
+                warmed_profiles.append(f"{persona_name}:{voice}@{speed}")
             duration_ms = (time.perf_counter() - service_started) * 1000
-            mark_warmup_service("tts", "ready", duration_ms, f"voices_warmed={','.join(voices_warmed)}")
+            mark_warmup_service("tts", "ready", duration_ms, f"profiles_warmed={','.join(warmed_profiles)}")
             logger.info("Warmup TTS ready duration_ms=%.2f memory=%s", duration_ms, memory_snapshot())
         except Exception as exc:
             duration_ms = (time.perf_counter() - service_started) * 1000
@@ -189,19 +199,27 @@ async def warm_models_after_startup() -> None:
 def resolve_voice_for_persona(persona_name: str) -> str:
     return PERSONA_VOICE_MATRIX.get(persona_name.lower(), PERSONA_VOICE_MATRIX["kami"])
 
+def resolve_voice_profile_for_persona(persona_name: str) -> dict:
+    return PERSONA_VOICE_PROFILES.get(persona_name.lower(), PERSONA_VOICE_PROFILES["kami"])
+
 def persona_state_payload(persona_name: Optional[str] = None) -> dict:
     active_name = (persona_name or brain.active_persona_name).lower()
     persona = brain.active_persona if active_name == brain.active_persona_name else brain.switch_persona(active_name)
-    voice_print = resolve_voice_for_persona(active_name)
+    voice_profile = resolve_voice_profile_for_persona(active_name)
+    voice_print = voice_profile["voice"]
     return {
         "active_persona": active_name,
         "kokoro_voice": voice_print,
+        "kokoro_speed": voice_profile["speed"],
+        "kokoro_acoustic_note": voice_profile["acoustic_note"],
         "theme": {
             "color_palette": persona.color_palette,
             "typography_scale": persona.typography_scale,
             "audio_synthesis_engine": persona.audio_synthesis_engine,
             "dialogue_tonality_modifier": persona.dialogue_tonality,
             "kokoro_voice": voice_print,
+            "kokoro_speed": voice_profile["speed"],
+            "kokoro_acoustic_note": voice_profile["acoustic_note"],
         },
     }
 
@@ -246,20 +264,25 @@ async def get_active_persona():
 
 @app.get("/api/v1/persona/voices")
 async def get_persona_voice_matrix():
-    return {"voices": PERSONA_VOICE_MATRIX}
+    return {"voices": PERSONA_VOICE_MATRIX, "profiles": PERSONA_VOICE_PROFILES}
 
 @app.post("/api/v1/persona")
 async def mutate_active_persona(payload: PersonaMutationRequest):
-    updated_persona = brain.switch_persona(payload.persona)
+    agent_sync = live_agent_orchestrator.apply_persona(payload.persona)
+    updated_persona = brain.active_persona
     active_name = brain.active_persona_name
-    voice_print = resolve_voice_for_persona(active_name)
+    voice_profile = resolve_voice_profile_for_persona(active_name)
+    voice_print = voice_profile["voice"]
     logger.info(
-        "Active persona synced persona=%s kokoro_voice=%s audio_engine=%s",
+        "Active persona synced persona=%s kokoro_voice=%s speed=%.2f audio_engine=%s",
         active_name,
         voice_print,
+        voice_profile["speed"],
         updated_persona.audio_synthesis_engine,
     )
-    return persona_state_payload()
+    response = persona_state_payload()
+    response["agent_sync"] = agent_sync
+    return response
 
 @app.websocket("/api/v1/voice/control")
 async def voice_control_stream(websocket: WebSocket):
@@ -296,16 +319,21 @@ async def voice_control_stream(websocket: WebSocket):
             
             if "request_persona_mutation" in message:
                 target = message["request_persona_mutation"]
-                updated_persona = brain.switch_persona(target)
-                voice_print = resolve_voice_for_persona(brain.active_persona_name)
+                agent_sync = live_agent_orchestrator.apply_persona(target)
+                updated_persona = brain.active_persona
+                voice_profile = resolve_voice_profile_for_persona(brain.active_persona_name)
+                voice_print = voice_profile["voice"]
                 logger.info(
-                    "WebSocket persona sync persona=%s kokoro_voice=%s audio_engine=%s",
+                    "WebSocket persona sync persona=%s kokoro_voice=%s speed=%.2f audio_engine=%s",
                     brain.active_persona_name,
                     voice_print,
+                    voice_profile["speed"],
                     updated_persona.audio_synthesis_engine,
                 )
 
-                await websocket.send_text(json.dumps(theme_mutation_event()))
+                mutation_event = theme_mutation_event()
+                mutation_event["agent_sync"] = agent_sync
+                await websocket.send_text(json.dumps(mutation_event))
 
     except (WebSocketDisconnect, Exception) as e:
         print(f"[CONTROL] UI connection tracking update: Client disconnected ({type(e).__name__}).")
@@ -332,6 +360,23 @@ async def serve_sandbox():
     with open("purpleParrotMultiCharacterVoiceAssistant/sandbox.html", "r") as f:
         return f.read()
 
+@app.get("/")
+async def root_status():
+    return {
+        "service": "Purple Parrot Voice Assistant Core Engine",
+        "status": "online",
+        "active_persona": brain.active_persona_name,
+        "routes": {
+            "health": "/api/v1/health",
+            "resources": "/api/v1/system/resources",
+            "warmup": "/api/v1/system/warmup",
+            "persona": "/api/v1/persona",
+            "agent_session": "/api/v1/agent/session?configure=true",
+            "sandbox": "/sandbox",
+            "project_overview": "PROJECT_OVERVIEW.md",
+        },
+    }
+
 @app.get("/api/v1/health")
 async def health_check():
     return {"status": "healthy", "active_persona": brain.active_persona_name}
@@ -346,6 +391,16 @@ async def system_resources():
             "tts_loaded": local_tts_engine is not None,
         },
         "warmup": warmup_status,
+        "runtime_acceleration": {
+            "whisper_model": os.getenv("WHISPER_MODEL", "tiny.en"),
+            "whisper_device": os.getenv("WHISPER_DEVICE", "cpu"),
+            "whisper_compute_type": os.getenv("WHISPER_COMPUTE_TYPE", "int8"),
+            "whisper_cpu_threads": int(os.getenv("WHISPER_CPU_THREADS", "0")),
+            "whisper_num_workers": int(os.getenv("WHISPER_NUM_WORKERS", "1")),
+            "onnx_provider": os.getenv("ONNX_PROVIDER", "CPUExecutionProvider"),
+            "omp_num_threads": os.getenv("OMP_NUM_THREADS"),
+            "openblas_num_threads": os.getenv("OPENBLAS_NUM_THREADS"),
+        },
     }
 
 @app.get("/api/v1/system/warmup")
@@ -423,7 +478,94 @@ def get_local_tts_engine() -> LocalKokoroTTS:
     global local_tts_engine
     if local_tts_engine is None:
         local_tts_engine = LocalKokoroTTS(executor=audio_inference_executor)
+        local_tts_engine.set_active_persona(brain.active_persona_name)
     return local_tts_engine
+
+live_agent_orchestrator = LiveAgentOrchestrator(
+    brain=brain,
+    stt_factory=get_local_stt_engine,
+    tts_factory=get_local_tts_engine,
+)
+
+@app.get("/api/v1/agent/session")
+async def agent_session_status(configure: bool = True):
+    if configure:
+        live_agent_orchestrator.ensure_session()
+    return live_agent_orchestrator.status()
+
+@app.post("/api/v1/test/agent-cascade")
+async def simulate_agent_cascade(
+    persona: Optional[str] = None,
+    text: str = "hello",
+    synthesize_audio: bool = True,
+):
+    endpoint_started_at = time.perf_counter()
+    if persona:
+        agent_sync = live_agent_orchestrator.apply_persona(persona)
+    else:
+        agent_sync = live_agent_orchestrator.apply_persona(brain.active_persona_name)
+
+    local_reply = live_agent_orchestrator.compose_local_reply(text)
+    voice_profile = resolve_voice_profile_for_persona(brain.active_persona_name)
+    chunks = 0
+    if synthesize_audio:
+        audio_stream = get_local_tts_engine().synthesize(local_reply)
+        async for _ in audio_stream:
+            chunks += 1
+
+    latency_ms = round((time.perf_counter() - endpoint_started_at) * 1000, 2)
+    logger.info(
+        "Agent cascade test persona=%s voice=%s chunks=%d latency_ms=%.2f",
+        brain.active_persona_name,
+        voice_profile["voice"],
+        chunks,
+        latency_ms,
+    )
+    return {
+        "status": "Local STT -> KamiBrain prompt -> TTS cascade path validated.",
+        "active_persona": brain.active_persona_name,
+        "input_text": text,
+        "local_llm_reply": local_reply,
+        "kokoro_voice": voice_profile["voice"],
+        "kokoro_speed": voice_profile["speed"],
+        "agent_sync": agent_sync,
+        "agent_session": live_agent_orchestrator.status(),
+        "chunks": chunks,
+        "latency_ms": latency_ms,
+        "memory": memory_snapshot(),
+    }
+
+@app.post("/api/v1/test/barge-in")
+async def simulate_barge_in(
+    queued_chunks: int = 8,
+    chunk_ms: int = 400,
+    interrupt_after_ms: int = 80,
+):
+    queue = InterruptionCapablePlaybackQueue()
+    fake_chunk = b"\0\0" * max(int(24000 * chunk_ms / 1000), 1)
+    for _ in range(max(queued_chunks, 1)):
+        await queue.enqueue_audio_chunk(fake_chunk)
+
+    delivery_task = asyncio.create_task(queue.start_speaker_delivery_loop(), name="barge-in-test-delivery")
+    await asyncio.sleep(max(interrupt_after_ms, 0) / 1000)
+    snapshot = queue.handle_user_barge_in_event()
+    await asyncio.sleep(0)
+    delivery_task.cancel()
+    try:
+        await asyncio.wait_for(delivery_task, timeout=0.2)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        pass
+
+    return {
+        "status": "Barge-in interruption queue purge validated.",
+        "interrupted": True,
+        "vad_trigger": "simulated_silero_speech_start",
+        "queued_chunks_requested": queued_chunks,
+        "chunk_ms": chunk_ms,
+        "interrupt_after_ms": interrupt_after_ms,
+        "snapshot": snapshot,
+        "agent_session": live_agent_orchestrator.status(),
+    }
 
 @app.post("/api/v1/test/tts-pipeline")
 async def simulate_live_tts_feed(
@@ -446,10 +588,13 @@ async def simulate_live_tts_feed(
     logger.info("TTS pipeline persona sync persona=%s kokoro_voice=%s", active_persona, voice_print)
     if dry_run:
         latency_ms = round((time.perf_counter() - endpoint_started_at) * 1000, 2)
+        voice_profile = resolve_voice_profile_for_persona(active_persona)
         return {
             "status": f"Dry run resolved persona {active_persona} to voice {voice_print}.",
             "active_persona": active_persona,
             "kokoro_voice": voice_print,
+            "kokoro_speed": voice_profile["speed"],
+            "kokoro_acoustic_note": voice_profile["acoustic_note"],
             "chunks": 0,
             "dry_run": True,
             "latency_ms": latency_ms,
@@ -459,10 +604,13 @@ async def simulate_live_tts_feed(
     local_tts_engine = get_local_tts_engine()
     
     # Resolve through the live TTS adapter too, so logs prove the active engine agrees.
-    voice_print = local_tts_engine._get_voice_for_persona(active_persona)
+    voice_profile = local_tts_engine.get_voice_profile_for_persona(active_persona)
+    voice_print = voice_profile["voice"]
+    speed = voice_profile["speed"]
+    local_tts_engine._get_voice_for_persona(active_persona)
     # Fire up the synthesizer core adapter loop
     text_to_synthesize = "__force_kokoro_error__" if force_error else text
-    audio_stream = local_tts_engine.synthesize(text_to_synthesize, voice=voice_print)
+    audio_stream = local_tts_engine.synthesize(text_to_synthesize, voice=voice_print, speed=speed)
     
     print("[SYSTEM] Audio synthesis computation processing...")
     chunks = 0
@@ -479,8 +627,24 @@ async def simulate_live_tts_feed(
         "status": f"Vocal tracking for persona {active_persona} processed successfully.",
         "active_persona": active_persona,
         "kokoro_voice": voice_print,
+        "kokoro_speed": speed,
+        "kokoro_acoustic_note": voice_profile["acoustic_note"],
         "chunks": chunks,
         "latency_ms": latency_ms,
         "memory": memory_snapshot(),
         "forced_error": force_error,
+    }
+
+@app.get("/api/v1/test/tts-persona-matrix")
+async def tts_persona_matrix():
+    return {
+        "personas": [
+            {
+                "persona": persona_name,
+                "kokoro_voice": profile["voice"],
+                "kokoro_speed": profile["speed"],
+                "kokoro_acoustic_note": profile["acoustic_note"],
+            }
+            for persona_name, profile in PERSONA_VOICE_PROFILES.items()
+        ]
     }

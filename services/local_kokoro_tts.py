@@ -8,18 +8,83 @@ import uuid
 from collections import OrderedDict
 from concurrent.futures import Executor
 from threading import Lock
-from typing import Optional
+from typing import Optional, TypedDict
 from huggingface_hub import hf_hub_download
 from livekit.agents import APIConnectOptions, tts
 
 logger = logging.getLogger("local_kokoro_tts")
 logger.setLevel(logging.INFO)
 
+class KokoroPersonaVoiceProfile(TypedDict):
+    voice: str
+    speed: float
+    acoustic_note: str
+
+
+KOKORO_PERSONA_VOICE_PROFILES: dict[str, KokoroPersonaVoiceProfile] = {
+    "kami": {
+        "voice": "af_bella",
+        "speed": 1.0,
+        "acoustic_note": "Warm, balanced, clear neutral narrator.",
+    },
+    "patty": {
+        "voice": "af_sarah",
+        "speed": 1.18,
+        "acoustic_note": "Bright, quick, expressive teen-energy profile.",
+    },
+    "bram": {
+        "voice": "am_puck",
+        "speed": 1.12,
+        "acoustic_note": "Bouncy casual young male profile.",
+    },
+    "atlas": {
+        "voice": "am_michael",
+        "speed": 0.92,
+        "acoustic_note": "Calm, polished, deeper adult male profile.",
+    },
+    "vela": {
+        "voice": "af_nova",
+        "speed": 0.98,
+        "acoustic_note": "Elegant, musical, theatrical female profile.",
+    },
+    "suki": {
+        "voice": "bf_lily",
+        "speed": 0.88,
+        "acoustic_note": "Soft, slow, quiet British female profile.",
+    },
+    "kiko": {
+        "voice": "am_eric",
+        "speed": 1.2,
+        "acoustic_note": "Fast, jumpy, bright young male profile.",
+    },
+    "nori": {
+        "voice": "af_kore",
+        "speed": 0.96,
+        "acoustic_note": "Cool, dry, confident female profile.",
+    },
+    "miso": {
+        "voice": "af_jessica",
+        "speed": 1.08,
+        "acoustic_note": "Small, precise, bright teen profile.",
+    },
+    "rune": {
+        "voice": "bf_emma",
+        "speed": 0.82,
+        "acoustic_note": "Soft, sleepy, old-soul British female profile.",
+    },
+    "tavo": {
+        "voice": "am_adam",
+        "speed": 0.84,
+        "acoustic_note": "Lower, slower, gruffer adult male profile.",
+    },
+    "zeni": {
+        "voice": "af_sky",
+        "speed": 1.0,
+        "acoustic_note": "Crisp, clean, controlled adult female profile.",
+    },
+}
 KOKORO_PERSONA_VOICE_MATRIX = {
-    "kami": "af_bella",       # Warm, balanced, clear female narrator
-    "patty": "af_sarah",      # High energy, faster pace young profile
-    "tavo": "am_adam",        # Deep, gravelly, mature tone profiling
-    "zeni": "af_sky"          # Analytical, crisp, clean speech tone
+    persona: profile["voice"] for persona, profile in KOKORO_PERSONA_VOICE_PROFILES.items()
 }
 
 class LocalKokoroTTS(tts.TTS):
@@ -31,6 +96,7 @@ class LocalKokoroTTS(tts.TTS):
         )
         self._executor = executor
         self._cache_size = cache_size or int(os.getenv("KOKORO_AUDIO_CACHE_SIZE", "64"))
+        self._pcm_block_ms = int(os.getenv("KOKORO_PCM_BLOCK_MS", "100"))
         self._audio_cache: OrderedDict[tuple[str, str, float], tuple[bytes, int, int]] = OrderedDict()
         self._cache_lock = Lock()
         # Import dynamically to isolate resource extraction paths
@@ -48,6 +114,8 @@ class LocalKokoroTTS(tts.TTS):
 
         # Map our System Persona Names to native high-quality Kokoro voice prints
         self._voice_print_matrix = KOKORO_PERSONA_VOICE_MATRIX
+        self._voice_profiles = KOKORO_PERSONA_VOICE_PROFILES
+        self._active_persona_name = "kami"
 
     def _resolve_model_assets(self) -> tuple[str, str]:
         model_path = os.getenv("KOKORO_MODEL_PATH")
@@ -80,9 +148,23 @@ class LocalKokoroTTS(tts.TTS):
             raise
 
     def _get_voice_for_persona(self, persona_name: str) -> str:
-        voice = self._voice_print_matrix.get(persona_name.lower(), KOKORO_PERSONA_VOICE_MATRIX["kami"])
+        voice = self.get_voice_profile_for_persona(persona_name)["voice"]
         logger.info("Resolved persona voice persona=%s kokoro_voice=%s", persona_name, voice)
         return voice
+
+    def get_voice_profile_for_persona(self, persona_name: str) -> KokoroPersonaVoiceProfile:
+        return self._voice_profiles.get(persona_name.lower(), self._voice_profiles["kami"])
+
+    def set_active_persona(self, persona_name: str) -> KokoroPersonaVoiceProfile:
+        self._active_persona_name = persona_name.lower()
+        profile = self.get_voice_profile_for_persona(self._active_persona_name)
+        logger.info(
+            "Active Kokoro persona updated persona=%s kokoro_voice=%s speed=%.2f",
+            self._active_persona_name,
+            profile["voice"],
+            profile["speed"],
+        )
+        return profile
 
     def create_pcm(self, text: str, voice: str, speed: float = 1.0) -> tuple[bytes, int, int, bool]:
         if text == "__force_kokoro_error__":
@@ -121,19 +203,24 @@ class LocalKokoroTTS(tts.TTS):
     def synthesize(
         self, 
         text: str, 
-        *, 
+        *,
         conn_options: Optional[APIConnectOptions] = None,
         voice: Optional[str] = None,
+        speed: float = 1.0,
     ) -> "LocalKokoroChunkedStream":
         """
         Synthesizes a standalone, static text block into a complete media frame return object.
         """
-        selected_voice = voice or "af_bella"
+        active_profile = self.get_voice_profile_for_persona(self._active_persona_name)
+        selected_voice = voice or active_profile["voice"]
+        selected_speed = speed if voice else active_profile["speed"]
         return LocalKokoroChunkedStream(
             tts=self,
             create_pcm=self.create_pcm,
             input_text=text,
             voice=selected_voice,
+            speed=selected_speed,
+            pcm_block_ms=self._pcm_block_ms,
             conn_options=conn_options or APIConnectOptions(),
             executor=self._executor,
         )
@@ -147,6 +234,8 @@ class LocalKokoroChunkedStream(tts.ChunkedStream):
         create_pcm,
         input_text: str,
         voice: str,
+        speed: float,
+        pcm_block_ms: int,
         conn_options: APIConnectOptions,
         executor: Executor | None,
     ):
@@ -154,6 +243,8 @@ class LocalKokoroChunkedStream(tts.ChunkedStream):
         self._create_pcm = create_pcm
         self._text = input_text
         self._voice = voice
+        self._speed = speed
+        self._pcm_block_ms = pcm_block_ms
         self._executor = executor
 
     async def _run(self, output_emitter: tts.AudioEmitter) -> None:
@@ -169,16 +260,17 @@ class LocalKokoroChunkedStream(tts.ChunkedStream):
             # Offload high-density audio wave synthesis to executor threads
             pcm_data, sample_rate, sample_count, cache_hit = await loop.run_in_executor(
                 self._executor,
-                lambda: self._create_pcm(self._text, self._voice, 1.0)
+                lambda: self._create_pcm(self._text, self._voice, self._speed)
             )
             synth_duration_ms = (time.perf_counter() - started_at) * 1000
 
             audio_duration_ms = (sample_count / max(sample_rate or 24000, 1)) * 1000
             logger.info(
-                "tts_synthesis_duration_ms=%.2f audio_duration_ms=%.2f voice=%s text_length=%d sample_rate=%s samples=%d cache_hit=%s fallback=%s",
+                "tts_synthesis_duration_ms=%.2f audio_duration_ms=%.2f voice=%s speed=%.2f text_length=%d sample_rate=%s samples=%d cache_hit=%s fallback=%s",
                 synth_duration_ms,
                 audio_duration_ms,
                 self._voice,
+                self._speed,
                 len(self._text),
                 sample_rate,
                 sample_count,
@@ -205,4 +297,16 @@ class LocalKokoroChunkedStream(tts.ChunkedStream):
             num_channels=1,
             mime_type="audio/pcm",
         )
-        output_emitter.push(pcm_data)
+        block_size = max(int((sample_rate or 24000) * 2 * self._pcm_block_ms / 1000), 2)
+        block_count = 0
+        for offset in range(0, len(pcm_data), block_size):
+            output_emitter.push(pcm_data[offset:offset + block_size])
+            block_count += 1
+        logger.info(
+            "tts_pcm_blocks_emitted voice=%s sample_rate=%s block_ms=%d blocks=%d bytes=%d",
+            self._voice,
+            sample_rate,
+            self._pcm_block_ms,
+            block_count,
+            len(pcm_data),
+        )

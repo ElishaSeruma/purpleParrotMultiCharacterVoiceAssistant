@@ -25,8 +25,26 @@ class LocalWhisperSTT(stt.STT):
         self._force_next_error = False
         # Load the tiny optimized faster-whisper model into local RAM/VRAM
         from faster_whisper import WhisperModel
-        logger.info("Initializing Localized Faster-Whisper Model matrix (cpu/tiny)...")
-        self._model = WhisperModel("tiny.en", device="cpu", compute_type="int8")
+        model_name = os.getenv("WHISPER_MODEL", "tiny.en")
+        device = os.getenv("WHISPER_DEVICE", "cpu")
+        compute_type = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+        cpu_threads = int(os.getenv("WHISPER_CPU_THREADS", "0"))
+        num_workers = int(os.getenv("WHISPER_NUM_WORKERS", "1"))
+        logger.info(
+            "Initializing Localized Faster-Whisper Model matrix model=%s device=%s compute_type=%s cpu_threads=%d num_workers=%d",
+            model_name,
+            device,
+            compute_type,
+            cpu_threads,
+            num_workers,
+        )
+        self._model = WhisperModel(
+            model_name,
+            device=device,
+            compute_type=compute_type,
+            cpu_threads=cpu_threads,
+            num_workers=num_workers,
+        )
         logger.info("Local Faster-Whisper Engine primed successfully.")
 
     def stream(
